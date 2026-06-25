@@ -1,0 +1,942 @@
+name: VastraCo CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force_all_services:
+        description: 'Run ALL service CI jobs regardless of changed files'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 078426574503.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # STAGE 0 — Detect which services changed
+  # ──────────────────────────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      frontend:        ${{ steps.filter.outputs.frontend }}
+      user-service:    ${{ steps.filter.outputs.user-service }}
+      product-service: ${{ steps.filter.outputs.product-service }}
+      order-service:   ${{ steps.filter.outputs.order-service }}
+      ai-service:      ${{ steps.filter.outputs.ai-service }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Paths Filter
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+            user-service:
+              - 'user-service/**'
+            product-service:
+              - 'product-service/**'
+            order-service:
+              - 'order-service/**'
+            ai-service:
+              - 'ai-service/**'
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # FRONTEND  (React / Node.js)
+  #
+  # Graph:  prepare → sonar ──┐
+  #                  snyk  ───┼── build-push
+  #                  trivy-fs ┘
+  # ══════════════════════════════════════════════════════════════════════════
+
+  frontend-prepare:
+    name: Frontend / Prepare & Test
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_all_services == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Install Dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Run Unit Tests
+        working-directory: frontend
+        run: |
+          TEST_SCRIPT=$(node -pe "(require('./package.json').scripts || {}).test || ''" 2>/dev/null || echo "")
+          if [ -z "$TEST_SCRIPT" ] || echo "$TEST_SCRIPT" | grep -qi "no test specified"; then
+            echo "ℹ️  No test script defined in package.json — skipping unit tests."
+          else
+            npm test
+          fi
+
+  frontend-sonar:
+    name: Frontend / SonarCloud
+    needs: frontend-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Install Dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: frontend
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  frontend-snyk:
+    name: Frontend / Snyk
+    needs: frontend-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Install Dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Dependency Scan
+        working-directory: frontend
+        run: snyk test --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  frontend-trivy-fs:
+    name: Frontend / Trivy FS
+    needs: frontend-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: frontend/
+          severity: CRITICAL
+          exit-code: '1'
+          format: table
+
+  frontend-build-push:
+    name: Frontend / Build & Push
+    needs: [frontend-sonar, frontend-snyk, frontend-trivy-fs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t frontend-service:${{ steps.vars.outputs.sha }} \
+            ./frontend
+
+      - name: Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: frontend-service:${{ steps.vars.outputs.sha }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push to ECR
+        run: |
+          ECR_URI="${{ env.ECR_REGISTRY }}/frontend-service"
+          docker tag frontend-service:${{ steps.vars.outputs.sha }} ${ECR_URI}:${{ steps.vars.outputs.sha }}
+          docker push ${ECR_URI}:${{ steps.vars.outputs.sha }}
+
+      - name: Generate Build Metadata
+        run: |
+          mkdir -p metadata
+          cat > metadata/metadata.json <<'EOF'
+          {
+            "service_name": "frontend",
+            "image_uri": "${{ env.ECR_REGISTRY }}/frontend-service:${{ steps.vars.outputs.sha }}",
+            "image_tag": "${{ steps.vars.outputs.sha }}"
+          }
+          EOF
+
+      - name: Upload Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata-frontend
+          path: metadata/metadata.json
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # USER SERVICE  (Node.js)
+  #
+  # Graph:  prepare → sonar ──┐
+  #                  snyk  ───┼── build-push
+  #                  trivy-fs ┘
+  # ══════════════════════════════════════════════════════════════════════════
+
+  user-service-prepare:
+    name: User Service / Prepare & Test
+    needs: detect-changes
+    if: needs.detect-changes.outputs.user-service == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_all_services == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: user-service/package.json
+
+      - name: Install Dependencies
+        working-directory: user-service
+        run: npm install
+
+      - name: Run Unit Tests
+        working-directory: user-service
+        run: |
+          TEST_SCRIPT=$(node -pe "(require('./package.json').scripts || {}).test || ''" 2>/dev/null || echo "")
+          if [ -z "$TEST_SCRIPT" ] || echo "$TEST_SCRIPT" | grep -qi "no test specified"; then
+            echo "ℹ️  No test script defined in package.json — skipping unit tests."
+          else
+            npm test
+          fi
+
+  user-service-sonar:
+    name: User Service / SonarCloud
+    needs: user-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: user-service/package.json
+
+      - name: Install Dependencies
+        working-directory: user-service
+        run: npm install
+
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: user-service
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  user-service-snyk:
+    name: User Service / Snyk
+    needs: user-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: user-service/package.json
+
+      - name: Install Dependencies
+        working-directory: user-service
+        run: npm install
+
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Dependency Scan
+        working-directory: user-service
+        run: snyk test --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  user-service-trivy-fs:
+    name: User Service / Trivy FS
+    needs: user-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: user-service/
+          severity: CRITICAL
+          exit-code: '1'
+          format: table
+
+  user-service-build-push:
+    name: User Service / Build & Push
+    needs: [user-service-sonar, user-service-snyk, user-service-trivy-fs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t user-service:${{ steps.vars.outputs.sha }} \
+            ./user-service
+
+      - name: Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: user-service:${{ steps.vars.outputs.sha }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push to ECR
+        run: |
+          ECR_URI="${{ env.ECR_REGISTRY }}/user-service"
+          docker tag user-service:${{ steps.vars.outputs.sha }} ${ECR_URI}:${{ steps.vars.outputs.sha }}
+          docker push ${ECR_URI}:${{ steps.vars.outputs.sha }}
+
+      - name: Generate Build Metadata
+        run: |
+          mkdir -p metadata
+          cat > metadata/metadata.json <<'EOF'
+          {
+            "service_name": "user-service",
+            "image_uri": "${{ env.ECR_REGISTRY }}/user-service:${{ steps.vars.outputs.sha }}",
+            "image_tag": "${{ steps.vars.outputs.sha }}"
+          }
+          EOF
+
+      - name: Upload Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata-user-service
+          path: metadata/metadata.json
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PRODUCT SERVICE  (Node.js)
+  #
+  # Graph:  prepare → sonar ──┐
+  #                  snyk  ───┼── build-push
+  #                  trivy-fs ┘
+  # ══════════════════════════════════════════════════════════════════════════
+
+  product-service-prepare:
+    name: Product Service / Prepare & Test
+    needs: detect-changes
+    if: needs.detect-changes.outputs.product-service == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_all_services == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: product-service/package.json
+
+      - name: Install Dependencies
+        working-directory: product-service
+        run: npm install
+
+      - name: Run Unit Tests
+        working-directory: product-service
+        run: |
+          TEST_SCRIPT=$(node -pe "(require('./package.json').scripts || {}).test || ''" 2>/dev/null || echo "")
+          if [ -z "$TEST_SCRIPT" ] || echo "$TEST_SCRIPT" | grep -qi "no test specified"; then
+            echo "ℹ️  No test script defined in package.json — skipping unit tests."
+          else
+            npm test
+          fi
+
+  product-service-sonar:
+    name: Product Service / SonarCloud
+    needs: product-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: product-service/package.json
+
+      - name: Install Dependencies
+        working-directory: product-service
+        run: npm install
+
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: product-service
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  product-service-snyk:
+    name: Product Service / Snyk
+    needs: product-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: product-service/package.json
+
+      - name: Install Dependencies
+        working-directory: product-service
+        run: npm install
+
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Dependency Scan
+        working-directory: product-service
+        run: snyk test --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  product-service-trivy-fs:
+    name: Product Service / Trivy FS
+    needs: product-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: product-service/
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+
+  product-service-build-push:
+    name: Product Service / Build & Push
+    needs: [product-service-sonar, product-service-snyk, product-service-trivy-fs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t product-service:${{ steps.vars.outputs.sha }} \
+            ./product-service
+
+      - name: Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: product-service:${{ steps.vars.outputs.sha }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push to ECR
+        run: |
+          ECR_URI="${{ env.ECR_REGISTRY }}/product-service"
+          docker tag product-service:${{ steps.vars.outputs.sha }} ${ECR_URI}:${{ steps.vars.outputs.sha }}
+          docker push ${ECR_URI}:${{ steps.vars.outputs.sha }}
+
+      - name: Generate Build Metadata
+        run: |
+          mkdir -p metadata
+          cat > metadata/metadata.json <<'EOF'
+          {
+            "service_name": "product-service",
+            "image_uri": "${{ env.ECR_REGISTRY }}/product-service:${{ steps.vars.outputs.sha }}",
+            "image_tag": "${{ steps.vars.outputs.sha }}"
+          }
+          EOF
+
+      - name: Upload Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata-product-service
+          path: metadata/metadata.json
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # ORDER SERVICE  (Node.js)
+  #
+  # Graph:  prepare → sonar ──┐
+  #                  snyk  ───┼── build-push
+  #                  trivy-fs ┘
+  # ══════════════════════════════════════════════════════════════════════════
+
+  order-service-prepare:
+    name: Order Service / Prepare & Test
+    needs: detect-changes
+    if: needs.detect-changes.outputs.order-service == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_all_services == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: order-service/package.json
+
+      - name: Install Dependencies
+        working-directory: order-service
+        run: npm install
+
+      - name: Run Unit Tests
+        working-directory: order-service
+        run: |
+          TEST_SCRIPT=$(node -pe "(require('./package.json').scripts || {}).test || ''" 2>/dev/null || echo "")
+          if [ -z "$TEST_SCRIPT" ] || echo "$TEST_SCRIPT" | grep -qi "no test specified"; then
+            echo "ℹ️  No test script defined in package.json — skipping unit tests."
+          else
+            npm test
+          fi
+
+  order-service-sonar:
+    name: Order Service / SonarCloud
+    needs: order-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: order-service/package.json
+
+      - name: Install Dependencies
+        working-directory: order-service
+        run: npm install
+
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: order-service
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  order-service-snyk:
+    name: Order Service / Snyk
+    needs: order-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: order-service/package.json
+
+      - name: Install Dependencies
+        working-directory: order-service
+        run: npm install
+
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Dependency Scan
+        working-directory: order-service
+        run: snyk test --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  order-service-trivy-fs:
+    name: Order Service / Trivy FS
+    needs: order-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: order-service/
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+
+  order-service-build-push:
+    name: Order Service / Build & Push
+    needs: [order-service-sonar, order-service-snyk, order-service-trivy-fs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t order-service:${{ steps.vars.outputs.sha }} \
+            ./order-service
+
+      - name: Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: order-service:${{ steps.vars.outputs.sha }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push to ECR
+        run: |
+          ECR_URI="${{ env.ECR_REGISTRY }}/order-service"
+          docker tag order-service:${{ steps.vars.outputs.sha }} ${ECR_URI}:${{ steps.vars.outputs.sha }}
+          docker push ${ECR_URI}:${{ steps.vars.outputs.sha }}
+
+      - name: Generate Build Metadata
+        run: |
+          mkdir -p metadata
+          cat > metadata/metadata.json <<'EOF'
+          {
+            "service_name": "order-service",
+            "image_uri": "${{ env.ECR_REGISTRY }}/order-service:${{ steps.vars.outputs.sha }}",
+            "image_tag": "${{ steps.vars.outputs.sha }}"
+          }
+          EOF
+
+      - name: Upload Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata-order-service
+          path: metadata/metadata.json
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AI SERVICE  (Python / FastAPI / LangGraph)
+  #
+  # Graph:  prepare → sonar ──┐
+  #                  snyk  ───┼── build-push
+  #                  trivy-fs ┘
+  # ══════════════════════════════════════════════════════════════════════════
+
+  ai-service-prepare:
+    name: AI Service / Prepare & Test
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ai-service == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_all_services == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ai-service/requirements.txt
+
+      - name: Install Dependencies
+        working-directory: ai-service
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run pytest
+        working-directory: ai-service
+        run: |
+          if find . \( -name "test_*.py" -o -name "*_test.py" \) -print -quit 2>/dev/null | grep -q . \
+             || [ -d "tests" ]; then
+            echo "Test files found — running pytest."
+            pytest --tb=short -q
+          else
+            echo "ℹ️  No test files or tests/ directory found — skipping pytest."
+          fi
+
+  ai-service-sonar:
+    name: AI Service / SonarCloud
+    needs: ai-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: ai-service
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  ai-service-snyk:
+    name: AI Service / Snyk
+    needs: ai-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ai-service/requirements.txt
+
+      - name: Install Dependencies
+        working-directory: ai-service
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Dependency Scan
+        working-directory: ai-service
+        run: snyk test --file=requirements.txt --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  ai-service-trivy-fs:
+    name: AI Service / Trivy FS
+    needs: ai-service-prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: ai-service/
+          severity: CRITICAL
+          exit-code: '1'
+          format: table
+
+  ai-service-build-push:
+    name: AI Service / Build & Push
+    needs: [ai-service-sonar, ai-service-snyk, ai-service-trivy-fs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Short SHA
+        id: vars
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t ai-service:${{ steps.vars.outputs.sha }} \
+            ./ai-service
+
+      - name: Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ai-service:${{ steps.vars.outputs.sha }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push to ECR
+        run: |
+          ECR_URI="${{ env.ECR_REGISTRY }}/ai-service"
+          docker tag ai-service:${{ steps.vars.outputs.sha }} ${ECR_URI}:${{ steps.vars.outputs.sha }}
+          docker push ${ECR_URI}:${{ steps.vars.outputs.sha }}
+
+      - name: Generate Build Metadata
+        run: |
+          mkdir -p metadata
+          cat > metadata/metadata.json <<'EOF'
+          {
+            "service_name": "ai-service",
+            "image_uri": "${{ env.ECR_REGISTRY }}/ai-service:${{ steps.vars.outputs.sha }}",
+            "image_tag": "${{ steps.vars.outputs.sha }}"
+          }
+          EOF
+
+      - name: Upload Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata-ai-service
+          path: metadata/metadata.json
+          retention-days: 1

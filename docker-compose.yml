@@ -1,0 +1,130 @@
+version: '3.8'
+
+services:
+  users-db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${USER_DB_USER}
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD}
+      POSTGRES_DB: ${USER_DB_NAME}
+    volumes:
+      - users_pgdata:/var/lib/postgresql/data
+    networks:
+      - vastraco-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${USER_DB_USER} -d ${USER_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  products-db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PRODUCT_DB_USER}
+      POSTGRES_PASSWORD: ${PRODUCT_DB_PASSWORD}
+      POSTGRES_DB: ${PRODUCT_DB_NAME}
+    volumes:
+      - products_pgdata:/var/lib/postgresql/data
+    networks:
+      - vastraco-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PRODUCT_DB_USER} -d ${PRODUCT_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  orders-db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ORDER_DB_USER}
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD}
+      POSTGRES_DB: ${ORDER_DB_NAME}
+    volumes:
+      - orders_pgdata:/var/lib/postgresql/data
+    networks:
+      - vastraco-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ORDER_DB_USER} -d ${ORDER_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  user-service:
+    image: harshithasrinivas03/user-service:latest
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    depends_on:
+      users-db:
+        condition: service_healthy
+    networks:
+      - vastraco-network
+
+  product-service:
+    image: harshithasrinivas03/product-service:latest
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+    env_file:
+      - .env
+    depends_on:
+      products-db:
+        condition: service_healthy
+    networks:
+      - vastraco-network
+
+  order-service:
+    image: harshithasrinivas03/order-service:latest
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    env_file:
+      - .env
+    depends_on:
+      orders-db:
+        condition: service_healthy
+    networks:
+      - vastraco-network
+
+  ai-service:
+    image: harshithasrinivas03/ai-service:latest
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    env_file:
+      - .env
+    environment:
+      - PRODUCT_SERVICE_URL=http://product-service:3002
+      - ORDER_SERVICE_URL=http://order-service:3003
+    depends_on:
+      - product-service
+      - order-service
+    networks:
+      - vastraco-network
+
+  frontend:
+    image: harshithasrinivas03/frontend-service:latest
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - user-service
+      - product-service
+      - order-service
+      - ai-service
+    networks:
+      - vastraco-network
+
+networks:
+  vastraco-network:
+    driver: bridge
+
+volumes:
+  users_pgdata:
+  products_pgdata:
+  orders_pgdata:

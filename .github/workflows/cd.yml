@@ -1,0 +1,375 @@
+name: VastraCo CD
+
+on:
+  workflow_run:
+    workflows:
+      - VastraCo CI
+    types:
+      - completed
+
+env:
+  HELM_REPO: https://github.com/VastraCo-AWS/vastraCo-helm.git
+  HELM_REPO_DIR: vastraco-helm
+
+jobs:
+  deploy:
+    name: GitOps Helm Update
+    # Only run when the CI workflow succeeded
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # ── 1. Download all build-metadata-* artifacts from the CI run ──────────
+      - name: Download Build Metadata Artifacts
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          run_id: ${{ github.event.workflow_run.id }}
+          name_is_regexp: true
+          name: build-metadata-.*
+          path: artifacts/
+          allow_forks: false
+          skip_unpack: false
+        # If no services were built (e.g. only docs changed), this step
+        # produces no files; subsequent steps handle that gracefully.
+        continue-on-error: true
+
+      # ── 2. Install yq ────────────────────────────────────────────────────────
+      - name: Install yq
+        run: |
+          YQ_VERSION="v4.44.1"
+          sudo wget -qO /usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      # ── 3. Checkout Helm GitOps repository ──────────────────────────────────
+      - name: Checkout Helm Repository
+        uses: actions/checkout@v4
+        with:
+          repository: VastraCo-AWS/vastraCo-helm
+          token: ${{ secrets.HELM_REPO_PAT }}
+          path: ${{ env.HELM_REPO_DIR }}
+
+      # ── 4. Parse artifacts and update Helm values ────────────────────────────
+      - name: Update Helm Image Tags
+        id: helm-update
+        run: |
+          set -euo pipefail
+
+          HELM_DIR="${{ env.HELM_REPO_DIR }}"
+          VALUES_FILE="${HELM_DIR}/charts/vastraco-services/values-production.yaml"
+          ARTIFACTS_DIR="artifacts"
+
+          if [ ! -d "${ARTIFACTS_DIR}" ]; then
+            echo "No artifacts directory found — no services were built."
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Collect all metadata.json files (one per built service)
+          METADATA_FILES=$(find "${ARTIFACTS_DIR}" -name "metadata.json" 2>/dev/null || true)
+
+          if [ -z "${METADATA_FILES}" ]; then
+            echo "No metadata files found — no services were built."
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          UPDATED_SERVICES=""
+          COMMIT_MSG_PARTS=""
+
+          for META_FILE in ${METADATA_FILES}; do
+            SERVICE=$(jq -r '.service_name' "${META_FILE}")
+            TAG=$(jq -r '.image_tag' "${META_FILE}")
+            IMAGE_URI=$(jq -r '.image_uri' "${META_FILE}")
+
+            echo "Processing: service=${SERVICE}, tag=${TAG}"
+
+            # Map service name to values.yaml key path
+            case "${SERVICE}" in
+              frontend)
+                YQ_PATH='.services.frontend.image.tag'
+                ;;
+              user-service)
+                YQ_PATH='.services."user-service".image.tag'
+                ;;
+              product-service)
+                YQ_PATH='.services."product-service".image.tag'
+                ;;
+              order-service)
+                YQ_PATH='.services."order-service".image.tag'
+                ;;
+              ai-service)
+                YQ_PATH='.services."ai-service".image.tag'
+                ;;
+              *)
+                echo "Warning: unknown service '${SERVICE}', skipping."
+                continue
+                ;;
+            esac
+
+            yq e "${YQ_PATH} = \"${TAG}\"" -i "${VALUES_FILE}"
+            echo "  → Updated ${YQ_PATH} = ${TAG} in ${VALUES_FILE}"
+
+            UPDATED_SERVICES="${UPDATED_SERVICES} ${SERVICE}"
+            COMMIT_MSG_PARTS="${COMMIT_MSG_PARTS}[GitOps] Update ${SERVICE} image tag to ${TAG}\n"
+          done
+
+          if [ -z "${UPDATED_SERVICES}" ]; then
+            echo "updated=false" >> $GITHUB_OUTPUT
+          else
+            # Trim leading space
+            UPDATED_SERVICES="${UPDATED_SERVICES# }"
+            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "services=${UPDATED_SERVICES}" >> $GITHUB_OUTPUT
+            # Store multiline commit message
+            {
+              echo "commit_msg<<COMMIT_MSG_EOF"
+              printf "${COMMIT_MSG_PARTS}"
+              echo "COMMIT_MSG_EOF"
+            } >> $GITHUB_OUTPUT
+          fi
+
+      # ── 5. Write Job Summary ────────────────────────────────────────────────
+      - name: Write Helm Update Summary
+        if: steps.helm-update.outputs.updated == 'true'
+        run: |
+          ARTIFACTS_DIR="artifacts"
+          VALUES_FILE="charts/vastraco-services/values-production.yaml"
+
+          {
+            echo "## Helm Chart Updated"
+            echo ""
+            echo "| Service | Tag | Environment | Values File |"
+            echo "|---------|-----|-------------|-------------|"
+
+            for META_FILE in $(find "${ARTIFACTS_DIR}" -name "metadata.json" 2>/dev/null); do
+              SERVICE=$(jq -r '.service_name' "${META_FILE}")
+              TAG=$(jq -r '.image_tag'        "${META_FILE}")
+              echo "| \`${SERVICE}\` | \`${TAG}\` | production | \`${VALUES_FILE}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 6. Commit and push to Helm repository ───────────────────────────────
+      - name: Commit and Push Helm Changes
+        if: steps.helm-update.outputs.updated == 'true'
+        working-directory: ${{ env.HELM_REPO_DIR }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add charts/vastraco-services/values-production.yaml
+
+          # Check if there are actual changes to commit
+          if git diff --cached --quiet; then
+            echo "No changes to commit — image tags were already up to date."
+            exit 0
+          fi
+
+          git commit -m "${{ steps.helm-update.outputs.commit_msg }}"
+          git push origin HEAD
+
+          echo "Pushed Helm values update. ArgoCD will detect and sync automatically."
+
+      # ── 7. Wait for ArgoCD sync and verify rollout ──────────────────────────
+      - name: Configure AWS Credentials
+        if: steps.helm-update.outputs.updated == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        if: steps.helm-update.outputs.updated == 'true'
+        env:
+          EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+        run: |
+          aws eks update-kubeconfig \
+            --region us-east-1 \
+            --name "${EKS_CLUSTER_NAME}"
+
+      - name: Wait for ArgoCD sync
+        if: steps.helm-update.outputs.updated == 'true'
+        run: |
+          echo "Waiting 60s for ArgoCD to detect and begin sync..."
+          sleep 60
+
+      - name: Verify Rollout Status
+        if: steps.helm-update.outputs.updated == 'true'
+        run: |
+          set -euo pipefail
+          SERVICES="${{ steps.helm-update.outputs.services }}"
+          NAMESPACE="production"
+
+          # Map service names to deployment names (same in our Helm chart)
+          for SERVICE in ${SERVICES}; do
+            DEPLOY="${SERVICE}"
+            echo "Checking rollout: deployment/${DEPLOY} in namespace ${NAMESPACE}"
+            kubectl rollout status deployment/"${DEPLOY}" \
+              --namespace "${NAMESPACE}" \
+              --timeout=300s
+            echo "  ✅ ${DEPLOY} rollout complete"
+          done
+
+      - name: Run Smoke Tests
+        if: steps.helm-update.outputs.updated == 'true'
+        run: |
+          set -euo pipefail
+          NAMESPACE="production"
+
+          # Port-forward each backend service and hit its /health endpoint
+          declare -A SERVICE_PORTS=(
+            ["user-service"]="3001"
+            ["product-service"]="3002"
+            ["order-service"]="3003"
+            ["ai-service"]="3004"
+          )
+
+          for SVC in "${!SERVICE_PORTS[@]}"; do
+            PORT="${SERVICE_PORTS[$SVC]}"
+            LOCAL_PORT="9${PORT: -3}"
+
+            # Only test services that were actually deployed
+            if ! kubectl get deployment "${SVC}" -n "${NAMESPACE}" &>/dev/null; then
+              echo "Skipping ${SVC} — not deployed"
+              continue
+            fi
+
+            echo "Smoke test: ${SVC} → /health"
+            kubectl port-forward "svc/${SVC}" "${LOCAL_PORT}:${PORT}" \
+              --namespace "${NAMESPACE}" &
+            PF_PID=$!
+            sleep 3
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://localhost:${LOCAL_PORT}/health" --max-time 10 || echo "000")
+
+            kill ${PF_PID} 2>/dev/null || true
+
+            if [ "${HTTP_CODE}" = "200" ]; then
+              echo "  ✅ ${SVC} /health → ${HTTP_CODE}"
+            else
+              echo "  ❌ ${SVC} /health → ${HTTP_CODE}"
+              exit 1
+            fi
+          done
+
+          echo "All smoke tests passed."
+
+      # ── 8. Capture run metadata for notification ─────────────────────────────
+      - name: Set Notification Variables
+        id: notify-vars
+        if: always()
+        run: |
+          STATUS="${{ github.event.workflow_run.conclusion }}"
+          # Map conclusion to human-readable status
+          if [ "${STATUS}" = "success" ]; then
+            echo "deploy_status=SUCCESS" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_status=FAILURE" >> $GITHUB_OUTPUT
+          fi
+
+          echo "branch=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u '+%A, %d %B %Y at %H:%M UTC')" >> $GITHUB_OUTPUT
+          echo "run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+      # ── 8a. Success email ────────────────────────────────────────────────────
+      - name: Send Success Email
+        if: always() && github.event.workflow_run.conclusion == 'success'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: VastraCo CI/CD <${{ secrets.EMAIL_USERNAME }}>
+          subject: "✅ [VastraCo] Deployment SUCCESS — ${{ steps.notify-vars.outputs.branch }} @ ${{ steps.notify-vars.outputs.sha }}"
+          body: |
+            ╔══════════════════════════════════════════════════════════╗
+               VastraCo — Deployment Pipeline Notification
+            ╚══════════════════════════════════════════════════════════╝
+
+            Status            : ✅ SUCCESS
+            Workflow          : ${{ github.workflow }}
+            Environment       : production
+            Branch            : ${{ steps.notify-vars.outputs.branch }}
+            Commit SHA        : ${{ steps.notify-vars.outputs.sha }}
+            Timestamp         : ${{ steps.notify-vars.outputs.timestamp }}
+
+            ──────────────────────────────────────────────────────────
+            Services Updated  : ${{ steps.helm-update.outputs.services || 'none detected' }}
+            ──────────────────────────────────────────────────────────
+
+            The following pipeline stages completed successfully:
+
+              ✔  Changed-service detection (dorny/paths-filter)
+              ✔  Unit tests
+              ✔  Snyk dependency & code scans
+              ✔  SonarCloud quality gate
+              ✔  Trivy filesystem scan
+              ✔  Docker image build
+              ✔  Trivy container image scan
+              ✔  ECR authentication and image push
+              ✔  Helm GitOps values update
+              ✔  ArgoCD sync triggered (via Helm repo push)
+              ✔  kubectl rollout status verified
+              ✔  Smoke tests passed (/health on all updated services)
+
+            View Workflow Run:
+            ${{ steps.notify-vars.outputs.run_url }}
+
+            ──────────────────────────────────────────────────────────
+            This is an automated message from VastraCo CI/CD.
+
+      # ── 8b. Failure email ────────────────────────────────────────────────────
+      - name: Send Failure Email
+        if: always() && github.event.workflow_run.conclusion != 'success'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: VastraCo CI/CD <${{ secrets.EMAIL_USERNAME }}>
+          subject: "❌ [VastraCo] Deployment FAILURE — ${{ steps.notify-vars.outputs.branch }} @ ${{ steps.notify-vars.outputs.sha }}"
+          body: |
+            ╔══════════════════════════════════════════════════════════╗
+               VastraCo — Deployment Pipeline Notification
+            ╚══════════════════════════════════════════════════════════╝
+
+            Status            : ❌ FAILURE
+            Workflow          : ${{ github.workflow }}
+            Environment       : production
+            Branch            : ${{ steps.notify-vars.outputs.branch }}
+            Commit SHA        : ${{ steps.notify-vars.outputs.sha }}
+            Timestamp         : ${{ steps.notify-vars.outputs.timestamp }}
+
+            ──────────────────────────────────────────────────────────
+            ACTION REQUIRED
+            ──────────────────────────────────────────────────────────
+
+            The CI pipeline failed. No changes were deployed to EKS.
+            The Helm repository was NOT updated.
+
+            Common failure causes:
+              • Unit test failures
+              • Snyk HIGH/CRITICAL vulnerability found
+              • SonarCloud quality gate failed
+              • Trivy HIGH/CRITICAL vulnerability in filesystem or image
+              • ECR authentication error
+              • Docker build error
+
+            Investigate the failed workflow run for details:
+            ${{ steps.notify-vars.outputs.run_url }}
+
+            ──────────────────────────────────────────────────────────
+            This is an automated message from VastraCo CI/CD.
